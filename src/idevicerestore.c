@@ -64,7 +64,7 @@ int main(int argc, char* argv[]) {
 	int optindex = 0;
 	char* ipsw = NULL;
 	char* uuid = NULL;
-	uint64_t ecid = 0;
+	int tss_enabled = 0;
 
 	// create an instance of our context
 	struct idevicerestore_client_t* client = (struct idevicerestore_client_t*) malloc(sizeof(struct idevicerestore_client_t));
@@ -81,20 +81,20 @@ int main(int argc, char* argv[]) {
 			return 0;
 
 		case 'd':
-			client->flags &= FLAG_DEBUG;
+			client->flags |= FLAG_DEBUG;
 			idevicerestore_debug = 1;
 			break;
 
 		case 'e':
-			client->flags &= FLAG_ERASE;
+			client->flags |= FLAG_ERASE;
 			break;
 
 		case 'c':
-			client->flags &= FLAG_CUSTOM;
+			client->flags |= FLAG_CUSTOM;
 			break;
 
 		case 'x':
-			client->flags &= FLAG_EXCLUDE;
+			client->flags |= FLAG_EXCLUDE;
 			break;
 
 		case 'u':
@@ -149,28 +149,25 @@ int main(int argc, char* argv[]) {
 	// extract buildmanifest
 	plist_t buildmanifest = NULL;
 	info("Extracting BuildManifest from IPSW\n");
-	if (extract_buildmanifest(client, ipsw, &buildmanifest) < 0) {
+	if (ipsw_extract_build_manifest(ipsw, &buildmanifest, &tss_enabled) < 0) {
 		error("ERROR: Unable to extract BuildManifest from %s\n", ipsw);
 		return -1;
 	}
 
-	// devices are listed in order from oldest to newest
-	// so we'll need their ECID
-	if (client->device->index > DEVICE_IPOD2G) {
-		debug("Creating TSS request\n");
-		// fetch the device's ECID for the TSS request
-		if (get_ecid(client, &client->ecid) < 0) {
-			error("ERROR: Unable to find device ECID\n");
-			return -1;
-		}
-		debug("Found ECID %llu\n", client->ecid);
+	/* print iOS information from the manifest */
+	build_manifest_print_information(buildmanifest);
+
+	if (client->flags & FLAG_CUSTOM) {
+		/* prevent signing custom firmware */
+		tss_enabled = 0;
+		info("Custom firmware requested. Disabled TSS request.\n");
 	}
 
 	// choose whether this is an upgrade or a restore (default to upgrade)
 	client->tss = NULL;
 	plist_t build_identity = NULL;
 	if (client->flags & FLAG_ERASE) {
-		build_identity = get_build_identity(client, buildmanifest, 0);
+		build_identity = build_manifest_get_build_identity(buildmanifest, 0);
 		if (build_identity == NULL) {
 			error("ERROR: Unable to find any build identities\n");
 			plist_free(buildmanifest);
@@ -181,32 +178,42 @@ int main(int argc, char* argv[]) {
 		// and list the valid ones
 		int i = 0;
 		int valid_builds = 0;
-		int build_count = get_build_count(buildmanifest);
+		int build_count = build_manifest_get_identity_count(buildmanifest);
 		for (i = 0; i < build_count; i++) {
-			build_identity = get_build_identity(client, buildmanifest, i);
+			build_identity = build_manifest_get_build_identity(buildmanifest, i);
 			valid_builds++;
 		}
 	}
 
-	if (client->flags & FLAG_CUSTOM > 0) {
-		if (client->device->index > DEVICE_IPOD2G) {
-			if (get_shsh_blobs(client, ecid, build_identity, &client->tss) < 0) {
-				error("ERROR: Unable to get SHSH blobs for this device\n");
-				return -1;
-			}
-		}
+	/* print information about current build identity */
+	build_identity_print_information(build_identity);
 
-		/* verify if we have tss records if required */
-		if ((client->device->index > DEVICE_IPOD2G) && (client->tss == NULL)) {
-			error("ERROR: Unable to proceed without a tss record.\n");
-			plist_free(buildmanifest);
+	/* retrieve shsh blobs if required */
+	if (tss_enabled) {
+		debug("Getting device's ECID for TSS request\n");
+		/* fetch the device's ECID for the TSS request */
+		if (get_ecid(client, &client->ecid) < 0) {
+			error("ERROR: Unable to find device ECID\n");
+			return -1;
+		}
+		info("Found ECID %llu\n", client->ecid);
+
+		if (get_shsh_blobs(client, client->ecid, build_identity, &client->tss) < 0) {
+			error("ERROR: Unable to get SHSH blobs for this device\n");
 			return -1;
 		}
 	}
 
+	/* verify if we have tss records if required */
+	if ((tss_enabled) && (client->tss == NULL)) {
+		error("ERROR: Unable to proceed without a TSS record.\n");
+		plist_free(buildmanifest);
+		return -1;
+	}
+
 	// Extract filesystem from IPSW and return its name
 	char* filesystem = NULL;
-	if (extract_filesystem(client, client->ipsw, build_identity, &filesystem) < 0) {
+	if (ipsw_extract_filesystem(client->ipsw, build_identity, &filesystem) < 0) {
 		error("ERROR: Unable to extract filesystem from IPSW\n");
 		if (client->tss)
 			plist_free(client->tss);
@@ -426,11 +433,6 @@ int get_cpid(struct idevicerestore_client_t* client, uint32_t* cpid) {
 }
 
 int get_ecid(struct idevicerestore_client_t* client, uint64_t* ecid) {
-	if(client->device->index <= DEVICE_IPOD2G) {
-		*ecid = 0;
-		return 0;
-	}
-
 	switch (client->mode->index) {
 	case MODE_NORMAL:
 		if (normal_get_ecid(client->uuid, ecid) < 0) {
@@ -455,32 +457,9 @@ int get_ecid(struct idevicerestore_client_t* client, uint64_t* ecid) {
 	return 0;
 }
 
-int extract_buildmanifest(struct idevicerestore_client_t* client, const char* ipsw, plist_t* buildmanifest) {
-	int size = 0;
-	char* data = NULL;
-	int device = client->device->index;
-
-	/* older devices don't require personalized firmwares and use a BuildManifesto.plist */
-	if (ipsw_extract_to_memory(ipsw, "BuildManifesto.plist", &data, &size) == 0) {
-		plist_from_xml(data, size, buildmanifest);
-		return 0;
-	}
-
-	data = NULL;
-	size = 0;
-
-	/* whereas newer devices do not require personalized firmwares and use a BuildManifest.plist */
-	if (ipsw_extract_to_memory(ipsw, "BuildManifest.plist", &data, &size) == 0) {
-		plist_from_xml(data, size, buildmanifest);
-		return 0;
-	}
-
-	return -1;
-}
-
-plist_t get_build_identity(struct idevicerestore_client_t* client, plist_t buildmanifest, uint32_t identity) {
+plist_t build_manifest_get_build_identity(plist_t build_manifest, uint32_t identity) {
 	// fetch build identities array from BuildManifest
-	plist_t build_identities_array = plist_dict_get_item(buildmanifest, "BuildIdentities");
+	plist_t build_identities_array = plist_dict_get_item(build_manifest, "BuildIdentities");
 	if (!build_identities_array || plist_get_node_type(build_identities_array) != PLIST_ARRAY) {
 		error("ERROR: Unable to find build identities node\n");
 		return NULL;
@@ -511,21 +490,24 @@ int get_shsh_blobs(struct idevicerestore_client_t* client, uint64_t ecid, plist_
 		return -1;
 	}
 
-	info("Sending TSS request\n");
+	info("Sending TSS request... ");
 	response = tss_send_request(request);
 	if (response == NULL) {
+		info("ERROR: Unable to send TSS request\n");
 		plist_free(request);
 		return -1;
 	}
+
+	info("received SHSH blobs\n");
 
 	plist_free(request);
 	*tss = response;
 	return 0;
 }
 
-int get_build_count(plist_t buildmanifest) {
+int build_manifest_get_identity_count(plist_t build_manifest) {
 	// fetch build identities array from BuildManifest
-	plist_t build_identities_array = plist_dict_get_item(buildmanifest, "BuildIdentities");
+	plist_t build_identities_array = plist_dict_get_item(build_manifest, "BuildIdentities");
 	if (!build_identities_array || plist_get_node_type(build_identities_array) != PLIST_ARRAY) {
 		error("ERROR: Unable to find build identities node\n");
 		return -1;
@@ -535,7 +517,7 @@ int get_build_count(plist_t buildmanifest) {
 	return plist_array_get_size(build_identities_array);
 }
 
-int extract_filesystem(struct idevicerestore_client_t* client, const char* ipsw, plist_t build_identity, char** filesystem) {
+int ipsw_extract_filesystem(const char* ipsw, plist_t build_identity, char** filesystem) {
 	char* filename = NULL;
 
 	if (build_identity_get_component_path(build_identity, "OS", &filename) < 0) {
@@ -573,7 +555,6 @@ int ipsw_get_component_by_path(const char* ipsw, plist_t tss, const char* path, 
 	}
 
 	if (tss) {
-		info("Signing img3...\n");
 		img3 = img3_parse_file(component_data, component_size);
 		if (img3 == NULL) {
 			error("ERROR: Unable to parse IMG3: %s\n", component_name);
@@ -589,6 +570,7 @@ int ipsw_get_component_by_path(const char* ipsw, plist_t tss, const char* path, 
 			return -1;
 		}
 
+		info("Signing %s\n", component_name);
 		if (img3_replace_signature(img3, component_blob) < 0) {
 			error("ERROR: Unable to replace IMG3 signature\n");
 			free(component_blob);
@@ -614,6 +596,73 @@ int ipsw_get_component_by_path(const char* ipsw, plist_t tss, const char* path, 
 	*data = component_data;
 	*size = component_size;
 	return 0;
+}
+
+void build_manifest_print_information(plist_t build_manifest) {
+	char* value = NULL;
+	plist_t node = NULL;
+
+	node = plist_dict_get_item(build_manifest, "ProductVersion");
+	if (!node || plist_get_node_type(node) != PLIST_STRING) {
+		error("ERROR: Unable to find ProductVersion node\n");
+		return;
+	}
+	plist_get_string_val(node, &value);
+
+	info("Product Version: %s\n", value);
+	free(value);
+
+	node = plist_dict_get_item(build_manifest, "ProductBuildVersion");
+	if (!node || plist_get_node_type(node) != PLIST_STRING) {
+		error("ERROR: Unable to find ProductBuildVersion node\n");
+		return;
+	}
+	plist_get_string_val(node, &value);
+
+	info("Product Build: %s\n", value);
+	free(value);
+
+	node = NULL;
+}
+
+void build_identity_print_information(plist_t build_identity) {
+	char* value = NULL;
+	plist_t info_node = NULL;
+	plist_t node = NULL;
+
+	info_node = plist_dict_get_item(build_identity, "Info");
+	if (!info_node || plist_get_node_type(info_node) != PLIST_DICT) {
+		error("ERROR: Unable to find Info node\n");
+		return;
+	}
+
+	node = plist_dict_get_item(info_node, "Variant");
+	if (!node || plist_get_node_type(node) != PLIST_STRING) {
+		error("ERROR: Unable to find Variant node\n");
+		return;
+	}
+	plist_get_string_val(node, &value);
+
+	info("Variant: %s\n", value);
+	free(value);
+
+	node = plist_dict_get_item(info_node, "RestoreBehavior");
+	if (!node || plist_get_node_type(node) != PLIST_STRING) {
+		error("ERROR: Unable to find RestoreBehavior node\n");
+		return;
+	}
+	plist_get_string_val(node, &value);
+
+	if (!strcmp(value, "Erase"))
+		info("This restore will erase your device data.\n");
+
+	if (!strcmp(value, "Update"))
+		info("This restore will update your device without loosing data.\n");
+
+	free(value);
+
+	info_node = NULL;
+	node = NULL;
 }
 
 int build_identity_get_component_path(plist_t build_identity, const char* component, char** path) {
